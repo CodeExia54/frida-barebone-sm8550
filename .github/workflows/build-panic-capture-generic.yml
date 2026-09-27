@@ -35,6 +35,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Patch panic_capture.c (panic_notifier_list via kallsyms)
+        run: |
+          set -e
+          python3 patch-panic-notifier-kallsyms.py panic_capture/panic_capture.c
+
       - name: Build panic_capture.ko
         run: |
           set -e
