@@ -1,0 +1,135 @@
+name: build-sdk-devkit-generic
+
+# Heavy, arch-only (arm64), non-BTI from-source build: the soft-float SDK
+# (picolibc + compiler-rt) and the GumJS devkit, with this repo's own
+# patch-gum-init.py / patch-gum-exception-null.py applied directly to
+# frida-gum source. Not KMI-specific - runs once per Frida version, on
+# GitHub's runners instead of a local machine, since it's the slow half
+# (Meson+Vala+GLib+QuickJS compile). The fast half - frida-agent.ko per KMI
+# target, using these artifacts - stays local (build-ko.sh) so it can be
+# rebuilt and QEMU-tested quickly without re-running this.
+
+on:
+  workflow_dispatch:
+    inputs:
+      frida_version:
+        description: 'frida-core/frida-gum tag to build'
+        type: string
+        default: '17.17.0'
+
+jobs:
+  build-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools (clang-19, python, binutils, build deps)
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            wget curl git xz-utils ca-certificates python3 python3-pip \
+            binutils-aarch64-linux-gnu \
+            clang-19 libclang-19-dev lld-19 \
+            gperf make gcc g++ pkg-config autoconf automake libtool cmake \
+            flex bison texinfo
+          python3 -m pip install --break-system-packages tomlkit
+          clang-19 --version | head -1
+
+      - name: Clone frida-core (${{ inputs.frida_version }}) + releng
+        run: |
+          set -e
+          git clone --depth 1 --branch ${{ inputs.frida_version }} --recurse-submodules \
+            https://github.com/frida/frida-core.git
+          cd frida-core
+          git submodule update --init --recursive --depth 1
+
+      - name: Build soft-float SDK (no BTI)
+        run: |
+          set -eo pipefail
+          export PATH="/usr/lib/llvm-19/bin:$PATH"
+          export CC="clang-19 --target=aarch64-none-elf"
+          export CXX="clang++-19 --target=aarch64-none-elf"
+          cd frida-core
+          python3 releng/deps.py build --bundle=sdk --host=none-arm64-softfloat 2>&1 | tail -100
+          ls -la deps/*.tar.xz
+
+      - name: Upload SDK bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-none-arm64-softfloat
+          path: frida-core/deps/sdk-none-arm64-softfloat.tar.xz
+          if-no-files-found: error
+
+  build-devkit:
+    needs: [build-sdk]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools (clang-19, python, binutils, build deps)
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            wget curl git xz-utils ca-certificates python3 python3-pip \
+            binutils-aarch64-linux-gnu \
+            clang-19 libclang-19-dev lld-19 \
+            gperf make gcc g++ pkg-config autoconf automake libtool cmake \
+            flex bison texinfo
+          python3 -m pip install --break-system-packages tomlkit
+
+      - name: Clone frida-gum (${{ inputs.frida_version }}) + releng
+        run: |
+          set -e
+          git clone --depth 1 --branch ${{ inputs.frida_version }} --recurse-submodules \
+            https://github.com/frida/frida-gum.git
+
+      - name: Patch gum.c (call glib_init/gobject_init unconditionally)
+        run: |
+          set -e
+          python3 patch-gum-init.py frida-gum/gum/gum.c
+          grep -n "glib_init\|gobject_init" frida-gum/gum/gum.c | head
+
+      - name: "Patch gumquickcore.c (NULL-guard strstr in exception handling)"
+        run: |
+          set -e
+          python3 patch-gum-exception-null.py frida-gum/bindings/gumjs/gumquickcore.c
+          grep -n "message != NULL" frida-gum/bindings/gumjs/gumquickcore.c
+
+      - name: Download SDK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sdk-none-arm64-softfloat
+          path: /tmp/sdk-artifact
+
+      - name: Stage SDK tarball for gum configure
+        run: |
+          set -e
+          mkdir -p frida-gum/deps
+          cp /tmp/sdk-artifact/sdk-none-arm64-softfloat.tar.xz frida-gum/deps/
+
+      - name: Configure GumJS devkit
+        run: |
+          set -eo pipefail
+          export PATH="/usr/lib/llvm-19/bin:$PATH"
+          export CC="clang-19 --target=aarch64-none-elf"
+          export CXX="clang++-19 --target=aarch64-none-elf"
+          cd frida-gum
+          ./configure --host=none-arm64-softfloat --enable-gumjs \
+            --with-devkits=gum,gumjs --with-devkit-symbol-scope=original 2>&1 | tail -60
+
+      - name: Build GumJS devkit
+        run: |
+          set -eo pipefail
+          export PATH="/usr/lib/llvm-19/bin:$PATH"
+          cd frida-gum
+          make 2>&1 | tail -80
+          ls -la build/bindings/gumjs/devkit/
+
+      - name: Upload GumJS devkit
+        uses: actions/upload-artifact@v4
+        with:
+          name: gumjs-devkit-none-arm64-softfloat
+          path: frida-gum/build/bindings/gumjs/devkit/
+          if-no-files-found: error
