@@ -1,13 +1,22 @@
 name: build-sdk-devkit-generic
 
-# Heavy, arch-only (arm64), non-BTI from-source build: the soft-float SDK
-# (picolibc + compiler-rt) and the GumJS devkit, with this repo's own
-# patch-gum-init.py / patch-gum-exception-null.py applied directly to
-# frida-gum source. Not KMI-specific - runs once per Frida version, on
-# GitHub's runners instead of a local machine, since it's the slow half
-# (Meson+Vala+GLib+QuickJS compile). The fast half - frida-agent.ko per KMI
-# target, using these artifacts - stays local (build-ko.sh) so it can be
-# rebuilt and QEMU-tested quickly without re-running this.
+# Full from-source pipeline for all 6 generic ddk KMI targets, entirely on
+# GitHub's runners - local disk can't hold this (frida-core/frida-gum
+# clones, Rust toolchains per KMI, cargo registries, docker layers all at
+# once). Manual test build only, same as pvm-modules' own ddk.yml: nothing
+# versioned or published, every artifact retention-days: 1.
+#
+#   build-sdk    -> soft-float SDK (picolibc + compiler-rt) from source,
+#                   arch-only (arm64), not KMI-specific.
+#   build-devkit -> GumJS devkit from source against that SDK, with this
+#                   repo's own patch-gum-init.py / patch-gum-exception-
+#                   null.py applied directly to frida-gum's gum.c - the
+#                   root-cause fix, not a workaround. Also arch-only.
+#   build-ko     -> frida-agent.ko, one matrix leg per KMI target
+#                   (android12-5.10 .. android17-6.18), each in its own
+#                   ghcr.io/ylarod/ddk:<kmi> container - the exact same
+#                   container-per-matrix-leg pattern pvm-modules'
+#                   .github/workflows/ddk.yml uses for its own modules.
 
 on:
   workflow_dispatch:
@@ -60,6 +69,7 @@ jobs:
           name: sdk-none-arm64-softfloat
           path: frida-core/deps/sdk-none-arm64-softfloat.tar.xz
           if-no-files-found: error
+          retention-days: 1
 
   build-devkit:
     needs: [build-sdk]
@@ -132,4 +142,125 @@ jobs:
         with:
           name: gumjs-devkit-none-arm64-softfloat
           path: frida-gum/build/bindings/gumjs/devkit/
+          if-no-files-found: error
+          retention-days: 1
+
+  build-ko:
+    needs: [build-devkit]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        kmi:
+          - android12-5.10
+          - android13-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+
+    container:
+      image: ghcr.io/ylarod/ddk:${{ matrix.kmi }}
+      options: --privileged
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-19 + Rust (aarch64-unknown-none + rust-src)
+        run: |
+          set -e
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            wget curl git xz-utils ca-certificates python3 python3-pip \
+            binutils-aarch64-linux-gnu clang-19 libclang-19-dev lld-19
+          python3 -m pip install --break-system-packages -q tomlkit
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable -q
+          . "$HOME/.cargo/env"
+          rustup target add aarch64-unknown-none
+          rustup component add rust-src
+
+      - name: Download SDK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sdk-none-arm64-softfloat
+          path: /tmp/sdk-artifact
+
+      - name: Download GumJS devkit artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gumjs-devkit-none-arm64-softfloat
+          path: /tmp/gumjs-devkit
+
+      - name: Clone frida-core (${{ inputs.frida_version }}) + releng
+        run: |
+          set -e
+          git clone --depth 1 --branch ${{ inputs.frida_version }} https://github.com/frida/frida-core.git
+          cd frida-core
+          git submodule update --init --depth 1 releng
+
+      - name: Patch frida-kmod.c (CFI fix + caches_clean_inval_pou via kallsyms)
+        run: |
+          set -e
+          python3 patch-cfi.py frida-core/src/barebone/agent/linux/frida-kmod.c
+          python3 patch-cache-flush-kallsyms.py frida-core/src/barebone/agent/linux/frida-kmod.c
+
+      - name: Per-KMI ccflags (android12-5.10 / android17-6.18 -Werror quirks)
+        run: |
+          cat >> frida-core/src/barebone/agent/linux/Kbuild <<'EOF'
+
+          ccflags-y += -Wno-implicit-function-declaration
+          ccflags-y += -Wno-missing-prototypes -Wno-missing-declarations
+          EOF
+
+      - name: Extract SDK
+        run: |
+          set -e
+          mkdir -p "$HOME/sdk-none-arm64-softfloat"
+          tar -C "$HOME/sdk-none-arm64-softfloat" -xf /tmp/sdk-artifact/sdk-none-arm64-softfloat.tar.xz
+
+      - name: Build frida-agent.ko
+        run: |
+          set -e
+          . "$HOME/.cargo/env"
+          export PATH="/opt/ddk/clang/"*"/bin:$PATH"
+          unset CLANG_PATH
+          export LIBCLANG_PATH=/usr/lib/llvm-19/lib
+
+          SDK="$HOME/sdk-none-arm64-softfloat"
+          export CC_AGENT="clang-19 --target=aarch64-none-elf -mabi=aapcs-soft \
+            -mgeneral-regs-only -ffixed-x18 -fno-pic --sysroot=$SDK \
+            -isystem $SDK/include -I $SDK/include/glib-2.0 -I $SDK/lib/glib-2.0/include \
+            -I $SDK/include/capstone -I $SDK/include/json-glib-1.0"
+
+          cd frida-core/src/barebone/agent/linux
+          make ARCH=arm64 FRIDA_SDK="$SDK" GUMJS_DEVKIT_DIR="/tmp/gumjs-devkit" \
+            AGENT_RUSTFLAGS="-Zfixed-x18" \
+            AGENT_LD=aarch64-linux-gnu-ld AGENT_AR=aarch64-linux-gnu-ar \
+            AGENT_NM=aarch64-linux-gnu-nm AGENT_OBJCOPY=aarch64-linux-gnu-objcopy \
+            CC_aarch64_unknown_none="$CC_AGENT" KDIR="$KDIR" LLVM=1
+          ls -la frida-agent.ko
+
+      - name: Strip SHF_RO_AFTER_INIT from .bss
+        run: |
+          set -e
+          python3 strip-bss-roafter.py frida-core/src/barebone/agent/linux/frida-agent.ko
+
+      - name: Rename + strip debug (pvm-modules' own ddk.yml naming convention)
+        run: |
+          set -e
+          mkdir -p out
+          TIMESTAMP=$(date +'%Y%m%d-%H%M%S')
+          KMI_NAME="${{ matrix.kmi }}"
+          KMI_NAME="${KMI_NAME//-/_}"
+          OUTPUT_NAME="frida-agent_${KMI_NAME}_${TIMESTAMP}.ko"
+          cp frida-core/src/barebone/agent/linux/frida-agent.ko "out/$OUTPUT_NAME"
+          llvm-strip -d "out/$OUTPUT_NAME"
+          modinfo "out/$OUTPUT_NAME"
+          echo "OUTPUT_NAME=$OUTPUT_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload frida-agent.ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: frida-agent-${{ matrix.kmi }}
+          path: out/${{ env.OUTPUT_NAME }}
+          retention-days: 1
           if-no-files-found: error
