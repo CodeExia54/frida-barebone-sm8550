@@ -1,0 +1,63 @@
+name: build-panic-capture-generic
+
+# panic_capture.ko for all 6 generic ddk KMI targets - the original
+# build-panic-capture.yml is pinned to the exact device-pinned
+# ghcr.io/ylarod/ddk-min:android13-5.15-20260313 image; this generalizes
+# it the same way build-sdk-devkit-generic.yml generalizes the frida-
+# agent.ko build. Manual test build, nothing versioned - retention-days: 1,
+# matching pvm-modules' own ddk.yml.
+#
+# Diagnostic tool, not something frida-agent.ko needs: registers a die/
+# panic notifier and writes the trap/PC/LR/SP/registers/panic message to
+# /data/local/tmp/panic_dump.txt on a crash, so a crash that kills the
+# device (no pstore) is still diagnosable after reboot. Useful to have on
+# hand if a *new*, unexplained crash ever shows up on real hardware.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        kmi:
+          - android12-5.10
+          - android13-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+
+    container:
+      image: ghcr.io/ylarod/ddk:${{ matrix.kmi }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build panic_capture.ko
+        run: |
+          set -e
+          make -C "$KDIR" M="$PWD/panic_capture" ARCH=arm64 modules
+          ls -la panic_capture/panic_capture.ko
+
+      - name: Rename + strip debug (pvm-modules' own ddk.yml naming convention)
+        run: |
+          set -e
+          mkdir -p out
+          TIMESTAMP=$(date +'%Y%m%d-%H%M%S')
+          KMI_NAME="${{ matrix.kmi }}"
+          KMI_NAME="${KMI_NAME//-/_}"
+          OUTPUT_NAME="panic_capture_${KMI_NAME}_${TIMESTAMP}.ko"
+          cp panic_capture/panic_capture.ko "out/$OUTPUT_NAME"
+          llvm-strip -d "out/$OUTPUT_NAME"
+          modinfo "out/$OUTPUT_NAME"
+          echo "OUTPUT_NAME=$OUTPUT_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload panic_capture.ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: panic-capture-${{ matrix.kmi }}
+          path: out/${{ env.OUTPUT_NAME }}
+          retention-days: 1
+          if-no-files-found: error
