@@ -1,34 +1,20 @@
 #!/usr/bin/env python3
 """GKI header-compat fixes for 17.18.0+ frida-kmod.c (the new injector code).
 
-Two problems the upstream code has against GKI kernel headers (all 6 KMI
-targets fail identically without these):
+Problems the upstream code has against GKI kernel headers / runtime:
 
-  #2 sysvsem: frida_adopt_target_context() reads leader->sysvsem.undo_list and
-     writes current->sysvsem.undo_list unconditionally, but GKI builds with
-     CONFIG_SYSVIPC off have no `sysvsem` member in task_struct
-     ("no member named 'sysvsem'"). Guard both with #ifdef CONFIG_SYSVIPC -
-     with no SysV IPC there is no undo list to adopt.
-
-  #3 kernel_symbol: the "expose module symbols" feature dereferences
-     struct kernel_symbol (mod->syms[i], sym->name_offset/value_offset), but
-     GKI module.h keeps it forward-declared only ("incomplete type"). Complete
-     it with the kernel's own layout.
-
-(#1, the fs_struct seqlock/lock mismatch, is fixed with -DFRIDA_HAVE_FS_STRUCT_LOCK
-in ccflags, not here.)
-
-Idempotent and tolerant: re-running is a no-op, and an unmatched anchor warns
-rather than hard-failing.
+  #1 fs_struct seqlock/lock mismatch (fixed in ccflags)
+  #2 sysvsem: guard with CONFIG_SYSVIPC
+  #3 kernel_symbol: guard with LINUX_VERSION_CODE >= 6.4.0
+  #4 quick_threads: guard with LINUX_VERSION_CODE >= 6.0.0
+  #5 kernel text page lookup: check frida_kernel_base before vmalloc_to_page
+     (prevents 5.10 vmalloc_to_page block mapping warning & NULL return)
+  #6 user_mode_thread NULL check in process_spawn_thread (absent on <=5.13)
 """
 import sys
 
 KSYM_MARKER = "FRIDA_KERNEL_SYMBOL_DEFINED"
 KSYM_ANCHOR = '#define FRIDA_CONTROL_TOKEN 0x1d5f9e6b2c7a4038ULL'
-# struct kernel_symbol is defined in <linux/export.h> on <=6.1 (5.10/5.15/6.1)
-# but only forward-declared (opaque) on 6.4+ (6.6/6.12/6.18), where the
-# module-symbol enumeration below fails to dereference it. Define it ONLY on
-# the kernels where it is opaque, or we hit "redefinition" on the older ones.
 KSYM_BLOCK = '''#define FRIDA_CONTROL_TOKEN 0x1d5f9e6b2c7a4038ULL
 
 #include <linux/version.h>
@@ -52,7 +38,6 @@ struct kernel_symbol {
 #endif
 #endif'''
 
-# signal_struct.quick_threads was added in 6.0; absent on 5.10/5.15.
 QT_OLD = "  leader->signal->quick_threads++;"
 QT_NEW = """#if LINUX_VERSION_CODE >= KERNEL_VERSION (6, 0, 0)
   leader->signal->quick_threads++;
@@ -77,6 +62,44 @@ SYSVSEM_USE_NEW = """#ifdef CONFIG_SYSVIPC
   }
 #endif
 }"""
+
+PAGE_FOR_VIRT_OLD = """static struct page *
+frida_page_for_virtual (unsigned long address)
+{
+  if (frida_is_vmalloc_or_module_addr ((void *) address))
+    return vmalloc_to_page ((void *) address);"""
+
+PAGE_FOR_VIRT_NEW = """static struct page *
+frida_page_for_virtual (unsigned long address)
+{
+  if (frida_kernel_base != 0 &&
+      address >= frida_kernel_base &&
+      address < frida_kernel_base + frida_kernel_size)
+    return pfn_to_page (__phys_to_pfn (__pa_symbol (address)));
+
+  if (frida_is_vmalloc_or_module_addr ((void *) address))
+  {
+    struct page * page = vmalloc_to_page ((void *) address);
+    if (page != NULL)
+      return page;
+  }"""
+
+SPAWN_NULL_OLD = """  ctx->leader = leader;
+
+  frida_kthread_use_mm_impl (mm);
+  tid = frida_user_mode_thread_impl (frida_spawn_trampoline, ctx, 0);"""
+
+SPAWN_NULL_NEW = """  ctx->leader = leader;
+
+  if (frida_user_mode_thread_impl == NULL)
+  {
+    kfree (ctx);
+    frida_mmput_impl (mm);
+    return -ENOSYS;
+  }
+
+  frida_kthread_use_mm_impl (mm);
+  tid = frida_user_mode_thread_impl (frida_spawn_trampoline, ctx, 0);"""
 
 
 def patch(path):
@@ -110,7 +133,7 @@ def patch(path):
     else:
         print(f"WARNING: sysvsem use anchor not found in {path}", file=sys.stderr)
 
-    # #4 quick_threads (signal_struct field, 6.0+)
+    # #4 quick_threads
     if QT_NEW in text:
         changed.append("quick_threads (already)")
     elif QT_OLD in text:
@@ -118,6 +141,24 @@ def patch(path):
         changed.append("quick_threads")
     else:
         print(f"WARNING: quick_threads anchor not found in {path}", file=sys.stderr)
+
+    # #5 page_for_virtual kernel text check
+    if "address >= frida_kernel_base" in text:
+        changed.append("page_for_virt (already)")
+    elif PAGE_FOR_VIRT_OLD in text:
+        text = text.replace(PAGE_FOR_VIRT_OLD, PAGE_FOR_VIRT_NEW, 1)
+        changed.append("page_for_virt")
+    else:
+        print(f"NOTE: page_for_virtual anchor not found in {path}")
+
+    # #6 user_mode_thread NULL check
+    if "frida_user_mode_thread_impl == NULL" in text:
+        changed.append("spawn_null_check (already)")
+    elif SPAWN_NULL_OLD in text:
+        text = text.replace(SPAWN_NULL_OLD, SPAWN_NULL_NEW, 1)
+        changed.append("spawn_null_check")
+    else:
+        print(f"NOTE: spawn_null anchor not found in {path}")
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
