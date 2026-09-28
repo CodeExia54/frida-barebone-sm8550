@@ -1,10 +1,10 @@
-name: build-frida-server-barebone
+name: build-frida-inject-barebone
 
 on:
   workflow_dispatch:
     inputs:
       frida_version:
-        description: Frida version tag to build (barebone-enabled frida-server)
+        description: Frida version tag to build (barebone-enabled frida-inject)
         required: true
         default: '17.19.0'
 
@@ -42,12 +42,12 @@ jobs:
       - name: Set ANDROID_NDK_ROOT
         run: echo "ANDROID_NDK_ROOT=${{ steps.ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
-      - name: Configure (arm64 + barebone backend)
+      - name: Configure (arm64 + barebone backend, inject tool)
         run: |
           ./configure \
             --prefix="$FRIDA_PREFIX" \
             --host=android-arm64 \
-            --enable-server \
+            --enable-inject \
             -- \
             -Dfrida-core:barebone_backend=enabled \
             -Dfrida-core:compiler_backend=disabled
@@ -63,11 +63,11 @@ jobs:
           find subprojects/frida-core -path '*barebone/agent/etc/linux-kmod*.json' -exec cp {} "$FRIDA_PREFIX/bin/" \;
           ls -la "$FRIDA_PREFIX/bin/"
 
-      - name: Upload frida-server + config
+      - name: Upload frida-inject + config
         uses: actions/upload-artifact@v4
         with:
-          name: frida-server-android-arm64-barebone-${{ inputs.frida_version }}
+          name: frida-inject-android-arm64-barebone-${{ inputs.frida_version }}
           path: |
-            ${{ env.FRIDA_PREFIX }}/bin/frida-server
+            ${{ env.FRIDA_PREFIX }}/bin/frida-inject
             ${{ env.FRIDA_PREFIX }}/bin/linux-kmod*.json
           if-no-files-found: error
