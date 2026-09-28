@@ -206,6 +206,7 @@ jobs:
           set -e
           python3 patch-cfi.py frida-core/src/barebone/agent/linux/frida-kmod.c
           python3 patch-cache-flush-kallsyms.py frida-core/src/barebone/agent/linux/frida-kmod.c
+          python3 patch-kmod-gki-compat.py frida-core/src/barebone/agent/linux/frida-kmod.c
 
       - name: Per-KMI ccflags (android12-5.10 / android17-6.18 -Werror quirks)
         run: |
@@ -213,6 +214,7 @@ jobs:
 
           ccflags-y += -Wno-implicit-function-declaration
           ccflags-y += -Wno-missing-prototypes -Wno-missing-declarations
+          ccflags-y += -DFRIDA_HAVE_FS_STRUCT_LOCK
           EOF
 
       - name: Extract SDK
