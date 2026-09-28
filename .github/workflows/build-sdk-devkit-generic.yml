@@ -224,7 +224,6 @@ jobs:
           python3 patch-cfi.py frida-core/src/barebone/agent/linux/frida-kmod.c
           python3 patch-cache-flush-kallsyms.py frida-core/src/barebone/agent/linux/frida-kmod.c
           python3 patch-kmod-gki-compat.py frida-core/src/barebone/agent/linux/frida-kmod.c
-          python3 patch-kmod-rw.py frida-core/src/barebone/agent/linux/frida-kmod.c
 
       - name: Per-KMI ccflags (-Werror quirks + fs_struct lock detection)
         run: |
