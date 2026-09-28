@@ -1,0 +1,174 @@
+name: qemu-verify-frida
+
+# Boots each GKI kernel (from its ddk image) under QEMU aarch64, insmods the
+# built frida-agent.ko, and drives it with a native aarch64 client - a real
+# runtime check, not just a compile. Adapted from pvm-modules' QEMU_TESTING.md.
+#
+# Per target it verifies:
+#   1. module loads clean, creates /dev/frida, no panic/Oops/BUG in dmesg
+#   2. barebone transport up  -> "frida: listening on /dev/frida"
+#   3. injector channel alive -> prctl(0x46524944, 32, 0, 0, TOKEN) returns
+#      the magic 0x46524944 (FRIDA_CONTROL_OP_PING in 17.18.0+)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: build-sdk-devkit-generic run id holding the frida-agent-<kmi> artifacts to test
+        required: true
+      frida_version:
+        description: Frida version (informational; the .ko comes from build_run_id)
+        required: false
+        default: '17.19.0'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi:
+          - android12-5.10
+          - android13-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+    container:
+      image: ghcr.io/ylarod/ddk:${{ matrix.kmi }}
+    steps:
+      - name: Install QEMU + tools
+        run: |
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            qemu-system-arm cpio gzip xz-utils zstd binutils \
+            gcc-aarch64-linux-gnu curl ca-certificates file
+          qemu-system-aarch64 --version | head -1
+
+      - name: Extract + objcopy bootable kernel Image
+        run: |
+          set -e
+          VM=/opt/ddk/kdir/${{ matrix.kmi }}/vmlinux
+          test -f "$VM" || { echo "vmlinux not found at $VM"; ls -la /opt/ddk/kdir/${{ matrix.kmi }}/ || true; exit 1; }
+          aarch64-linux-gnu-objcopy -O binary -R .note -R .comment -S "$VM" Image
+          echo "Image: $(stat -c %s Image) bytes"
+          # arm64 Image magic "ARM\x64" lives at offset 0x38
+          od -An -tx1 -j56 -N8 Image
+
+      - name: Download frida-agent.ko artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frida-agent-${{ matrix.kmi }}
+          path: ko
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run_id }}
+          repository: ${{ github.repository }}
+
+      - name: Build aarch64 smoke-test client
+        run: |
+          set -e
+          cat > client.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <errno.h>
+          #include <sys/prctl.h>
+
+          #define FRIDA_CONTROL_MAGIC 0x46524944UL
+          #define FRIDA_CONTROL_TOKEN 0x1d5f9e6b2c7a4038UL
+          #define FRIDA_CONTROL_OP_PING 32UL
+
+          int main(void)
+          {
+            int fd = open("/dev/frida", O_RDWR);
+            if (fd >= 0) { printf("FRIDA_DEV_OPEN_OK\n"); close(fd); }
+            else         printf("FRIDA_DEV_OPEN_FAIL errno=%d\n", errno);
+
+            long r = prctl((int) FRIDA_CONTROL_MAGIC, FRIDA_CONTROL_OP_PING,
+                           0UL, 0UL, FRIDA_CONTROL_TOKEN);
+            if ((unsigned long) r == FRIDA_CONTROL_MAGIC)
+              printf("FRIDA_PING_OK r=0x%lx\n", r);
+            else
+              printf("FRIDA_PING_FAIL r=%ld\n", r);
+
+            fflush(stdout);
+            return 0;
+          }
+          EOF
+          aarch64-linux-gnu-gcc -static -O0 -o client client.c
+          file client
+
+      - name: Build busybox initramfs
+        run: |
+          set -e
+          base=http://ports.ubuntu.com/pool/main/b/busybox/
+          deb=$(curl -sL "$base" | grep -oE 'busybox-static_[^"]*_arm64\.deb' | sort -V | tail -1)
+          echo "busybox deb: $deb"
+          curl -sL "$base$deb" -o bb.deb
+          ar x bb.deb
+          bbpath=$(tar -I zstd -tf data.tar.zst | grep -E 'bin/busybox$' | head -1)
+          tar -I zstd -xf data.tar.zst "$bbpath"
+
+          mkdir -p rootfs/{bin,sbin,proc,sys,dev,root,etc,tmp}
+          cp ".$bbpath" rootfs/bin/busybox 2>/dev/null || cp "$bbpath" rootfs/bin/busybox
+          chmod +x rootfs/bin/busybox
+          cp client rootfs/root/client
+          cp ko/*.ko rootfs/root/frida-agent.ko
+          ls -la rootfs/root/
+
+          cat > rootfs/init <<'EOF'
+          #!/bin/busybox sh
+          /bin/busybox mkdir -p /proc /sys /dev /tmp
+          /bin/busybox mount -t proc proc /proc
+          /bin/busybox mount -t sysfs sysfs /sys
+          /bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
+          /bin/busybox --install -s /bin
+
+          echo "=== QEMU_FRIDA_VERIFY START ==="
+          insmod /root/frida-agent.ko 2>&1 || insmod -f /root/frida-agent.ko 2>&1
+          sleep 1
+          echo "--- /dev/frida ---"
+          ls -l /dev/frida 2>&1 && echo "FRIDA_DEV_PRESENT" || echo "FRIDA_DEV_MISSING"
+          echo "--- dmesg (frida) ---"
+          dmesg | grep -i frida
+          echo "--- client ---"
+          /root/client
+          echo "--- panic scan ---"
+          dmesg | grep -E "Kernel panic|Oops|BUG: |Call trace:|Unable to handle" && echo "FRIDA_CRASH_FOUND" || echo "FRIDA_NO_CRASH"
+          echo "=== QEMU_FRIDA_VERIFY DONE ==="
+          poweroff -f
+          EOF
+          chmod +x rootfs/init
+          (cd rootfs && find . | cpio -o -H newc 2>/dev/null | gzip -9 > ../initramfs.cpio.gz)
+          echo "initramfs: $(stat -c %s initramfs.cpio.gz) bytes"
+
+      - name: Boot QEMU
+        run: |
+          set -e
+          timeout 240 qemu-system-aarch64 \
+            -M virt -cpu cortex-a72 -smp 2 -m 1024 \
+            -kernel Image -initrd initramfs.cpio.gz \
+            -append "console=ttyAMA0 earlycon=pl011,0x9000000 panic=-1 loglevel=8 ignore_loglevel" \
+            -display none -serial file:serial.log -no-reboot || true
+          echo "=================== SERIAL LOG ==================="
+          cat serial.log || true
+          echo "=================================================="
+
+      - name: Evaluate result
+        run: |
+          set -e
+          log=serial.log
+          fail=0
+          grep -q "QEMU_FRIDA_VERIFY DONE" "$log" || { echo "::error::${{ matrix.kmi }}: guest did not reach DONE (boot/hang)"; fail=1; }
+          grep -q "listening on /dev/frida" "$log" || { echo "::error::${{ matrix.kmi }}: no 'listening on /dev/frida'"; fail=1; }
+          grep -q "FRIDA_PING_OK" "$log" || { echo "::error::${{ matrix.kmi }}: injector prctl ping did not return magic"; fail=1; }
+          if grep -qE "FRIDA_CRASH_FOUND|Kernel panic|Oops|BUG: |Call trace:|Unable to handle" "$log"; then
+            echo "::error::${{ matrix.kmi }}: crash detected in dmesg"; fail=1
+          fi
+          if [ "$fail" = 0 ]; then
+            echo "::notice::${{ matrix.kmi }}: PASS (loads clean, /dev/frida up, injector ping OK)"
+          fi
+          exit $fail
