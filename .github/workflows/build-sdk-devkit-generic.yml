@@ -208,14 +208,30 @@ jobs:
           python3 patch-cache-flush-kallsyms.py frida-core/src/barebone/agent/linux/frida-kmod.c
           python3 patch-kmod-gki-compat.py frida-core/src/barebone/agent/linux/frida-kmod.c
 
-      - name: Per-KMI ccflags (android12-5.10 / android17-6.18 -Werror quirks)
+      - name: Per-KMI ccflags (-Werror quirks + fs_struct lock detection)
         run: |
-          cat >> frida-core/src/barebone/agent/linux/Kbuild <<'EOF'
+          KB=frida-core/src/barebone/agent/linux/Kbuild
+          cat >> "$KB" <<'EOF'
 
           ccflags-y += -Wno-implicit-function-declaration
           ccflags-y += -Wno-missing-prototypes -Wno-missing-declarations
-          ccflags-y += -DFRIDA_HAVE_FS_STRUCT_LOCK
           EOF
+          # fs_struct locking differs across GKI: 5.10-6.12 have `spinlock_t lock`
+          # (use spin_lock(&fs->lock) via FRIDA_HAVE_FS_STRUCT_LOCK); 6.18 dropped
+          # it back to a plain `seqlock_t seq` (use the read_seqlock_excl default).
+          # Detect from the target kernel's own header rather than hardcode.
+          FS=""
+          for c in "/opt/ddk/src/${{ matrix.kmi }}/include/linux/fs_struct.h" \
+                   "/opt/ddk/kdir/${{ matrix.kmi }}/include/linux/fs_struct.h"; do
+            [ -f "$c" ] && { FS="$c"; break; }
+          done
+          echo "fs_struct.h: ${FS:-NOT FOUND}"
+          if [ -n "$FS" ] && grep -qE 'spinlock_t[[:space:]]+lock;' "$FS"; then
+            echo 'ccflags-y += -DFRIDA_HAVE_FS_STRUCT_LOCK' >> "$KB"
+            echo "-> fs_struct has 'lock': FRIDA_HAVE_FS_STRUCT_LOCK enabled"
+          else
+            echo "-> fs_struct has no 'lock': using read_seqlock_excl(&fs->seq) default"
+          fi
 
       - name: Extract SDK
         run: |
