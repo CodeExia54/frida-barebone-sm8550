@@ -152,6 +152,7 @@ jobs:
     needs: [build-devkit]
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         kmi:
           - android12-5.10
@@ -229,6 +230,12 @@ jobs:
           export LIBCLANG_PATH=/usr/lib/llvm-19/lib
 
           SDK="$HOME/sdk-none-arm64-softfloat"
+          # bindgen parses frida-gumjs.h with libclang and needs clang's own
+          # builtin headers (stddef.h etc.) which the bare-metal --sysroot=$SDK
+          # invocation does not add on its own (17.19.0's devkit header pulls in
+          # <stddef.h>). Point bindgen at the compiler resource dir plus the SDK
+          # includes the header also reaches for.
+          export BINDGEN_EXTRA_CLANG_ARGS="-isystem $(clang-19 -print-resource-dir)/include -isystem $SDK/include -I$SDK/include/glib-2.0 -I$SDK/lib/glib-2.0/include -I$SDK/include/capstone -I$SDK/include/json-glib-1.0 --sysroot=$SDK --target=aarch64-none-elf"
           export CC_AGENT="clang-19 --target=aarch64-none-elf -mabi=aapcs-soft \
             -mgeneral-regs-only -ffixed-x18 -fno-pic --sysroot=$SDK \
             -isystem $SDK/include -I $SDK/include/glib-2.0 -I $SDK/lib/glib-2.0/include \
