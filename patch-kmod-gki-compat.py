@@ -90,16 +90,100 @@ SPAWN_NULL_OLD = """  ctx->leader = leader;
   tid = frida_user_mode_thread_impl (frida_spawn_trampoline, ctx, 0);"""
 
 SPAWN_NULL_NEW = """  ctx->leader = leader;
-
-  if (frida_user_mode_thread_impl == NULL)
-  {
-    kfree (ctx);
-    frida_mmput_impl (mm);
-    return -ENOSYS;
-  }
+  ctx->mm = mm;
+  mmget (mm);
 
   frida_kthread_use_mm_impl (mm);
-  tid = frida_user_mode_thread_impl (frida_spawn_trampoline, ctx, 0);"""
+  tid = frida_spawn_thread_compat (frida_spawn_trampoline, ctx);"""
+
+# --- kernel_clone fallback plumbing (for <5.18 without user_mode_thread) ---
+KCLONE_TYPEDEF_OLD = "typedef pid_t (* FridaUserModeThreadFunc) (int (* fn) (void *), void * arg, unsigned long flags);"
+KCLONE_TYPEDEF_NEW = """typedef pid_t (* FridaUserModeThreadFunc) (int (* fn) (void *), void * arg, unsigned long flags);
+typedef pid_t (* FridaKernelCloneFunc) (struct kernel_clone_args * args);"""
+
+KCLONE_DECL_OLD = "static FridaUserModeThreadFunc frida_user_mode_thread_impl;"
+KCLONE_DECL_NEW = """static FridaUserModeThreadFunc frida_user_mode_thread_impl;
+static FridaKernelCloneFunc frida_kernel_clone_impl;"""
+
+KCLONE_RESOLVE_OLD = '  frida_user_mode_thread_impl = (FridaUserModeThreadFunc) frida_kmod_find_function ("user_mode_thread");'
+KCLONE_RESOLVE_NEW = '''  frida_user_mode_thread_impl = (FridaUserModeThreadFunc) frida_kmod_find_function ("user_mode_thread");
+  frida_kernel_clone_impl = (FridaKernelCloneFunc) frida_kmod_find_function ("kernel_clone");'''
+
+CTX_MM_OLD = """struct frida_spawn_ctx
+{
+  u64 entry;
+  u64 stack;
+  u64 arg;
+  u64 tls;
+  struct task_struct * leader;
+};"""
+CTX_MM_NEW = """struct frida_spawn_ctx
+{
+  u64 entry;
+  u64 stack;
+  u64 arg;
+  u64 tls;
+  struct task_struct * leader;
+  struct mm_struct * mm;
+};"""
+
+# cfi runs first and may add __nocfi to the spawn fn, so match both forms and
+# insert the helper definition just before whichever one is present.
+COMPAT_FN_ANCHORS = [
+    "int __nocfi\nfrida_kmod_process_spawn_thread (int pid,",
+    "int\nfrida_kmod_process_spawn_thread (int pid,",
+]
+COMPAT_HELPER = """static int __nocfi
+frida_spawn_thread_compat (int (* fn) (void *), void * arg)
+{
+  if (frida_user_mode_thread_impl != NULL)
+    return frida_user_mode_thread_impl (fn, arg, 0);
+
+  if (frida_kernel_clone_impl != NULL)
+  {
+    /* Pre-5.18: no user_mode_thread(). kernel_clone() with fn in .stack makes a
+     * kernel thread; frida_spawn_trampoline converts it to a user thread. Only
+     * fields present on every kernel are set; the rest zero-init. */
+    struct kernel_clone_args args = {
+      .flags = CLONE_VM | CLONE_UNTRACED,
+      .exit_signal = 0,
+      .stack = (unsigned long) fn,
+      .stack_size = (unsigned long) arg,
+    };
+    return frida_kernel_clone_impl (&args);
+  }
+
+  return -ENOSYS;
+}
+
+"""
+
+TRAMP_OLD = """  regs = task_pt_regs (current);
+
+  kfree (data);
+
+  frida_reparent_into_group (ctx.leader);"""
+TRAMP_NEW = """  regs = task_pt_regs (current);
+
+  kfree (data);
+
+  /* On the kernel_clone fallback (<5.18) this was created as a kernel thread
+   * with no mm; make it a real user thread and adopt the target mm carried in
+   * ctx.mm. On the user_mode_thread path current->mm is already set, so just
+   * drop the extra ref the caller took. */
+  current->flags &= ~PF_KTHREAD;
+  if (current->mm == NULL && ctx.mm != NULL)
+  {
+    mmgrab (ctx.mm);
+    current->active_mm = ctx.mm;
+    current->mm = ctx.mm;
+  }
+  else if (ctx.mm != NULL)
+  {
+    frida_mmput_impl (ctx.mm);
+  }
+
+  frida_reparent_into_group (ctx.leader);"""
 
 DETACH_SIG_OLD = "typedef void (* FridaDetachPidFunc) (struct pid ** pids, struct task_struct * task, enum pid_type type);"
 DETACH_SIG_NEW = "typedef void (* FridaDetachPidFunc) (struct task_struct * task, enum pid_type type);"
@@ -189,14 +273,47 @@ def patch(path):
     else:
         print(f"NOTE: page_for_virtual anchor not found in {path}")
 
-    # #6 user_mode_thread NULL check
-    if "frida_user_mode_thread_impl == NULL" in text:
-        changed.append("spawn_null_check (already)")
-    elif SPAWN_NULL_OLD in text:
-        text = text.replace(SPAWN_NULL_OLD, SPAWN_NULL_NEW, 1)
-        changed.append("spawn_null_check")
+    # #6 user_mode_thread -> kernel_clone fallback for <5.18 (5.10/5.15)
+    if "frida_spawn_thread_compat" in text:
+        changed.append("spawn_fallback (already)")
     else:
-        print(f"NOTE: spawn_null anchor not found in {path}")
+        # ctx->mm field
+        if CTX_MM_OLD in text:
+            text = text.replace(CTX_MM_OLD, CTX_MM_NEW, 1); changed.append("ctx_mm")
+        else:
+            print(f"WARNING: frida_spawn_ctx anchor not found in {path}", file=sys.stderr)
+        # kernel_clone typedef / decl / resolve
+        if KCLONE_TYPEDEF_OLD in text:
+            text = text.replace(KCLONE_TYPEDEF_OLD, KCLONE_TYPEDEF_NEW, 1)
+        else:
+            print(f"WARNING: kclone typedef anchor not found in {path}", file=sys.stderr)
+        if KCLONE_DECL_OLD in text:
+            text = text.replace(KCLONE_DECL_OLD, KCLONE_DECL_NEW, 1)
+        else:
+            print(f"WARNING: kclone decl anchor not found in {path}", file=sys.stderr)
+        if KCLONE_RESOLVE_OLD in text:
+            text = text.replace(KCLONE_RESOLVE_OLD, KCLONE_RESOLVE_NEW, 1)
+        else:
+            print(f"WARNING: kclone resolve anchor not found in {path}", file=sys.stderr)
+        # compat helper fn (inserted before frida_kmod_process_spawn_thread)
+        _fn_done = False
+        for _anchor in COMPAT_FN_ANCHORS:
+            if _anchor in text:
+                text = text.replace(_anchor, COMPAT_HELPER + _anchor, 1)
+                _fn_done = True
+                break
+        if not _fn_done:
+            print(f"WARNING: spawn_thread fn anchor not found in {path}", file=sys.stderr)
+        # trampoline PF_KTHREAD clear + mm adoption
+        if TRAMP_OLD in text:
+            text = text.replace(TRAMP_OLD, TRAMP_NEW, 1)
+        else:
+            print(f"WARNING: trampoline anchor not found in {path}", file=sys.stderr)
+        # spawn call site
+        if SPAWN_NULL_OLD in text:
+            text = text.replace(SPAWN_NULL_OLD, SPAWN_NULL_NEW, 1); changed.append("spawn_fallback")
+        else:
+            print(f"NOTE: spawn call-site anchor not found in {path}")
 
     # #7 detach_pid signature & invocation fix (2 args in Linux >= 6.1)
     if "typedef void (* FridaDetachPidFunc) (struct task_struct * task" in text:
