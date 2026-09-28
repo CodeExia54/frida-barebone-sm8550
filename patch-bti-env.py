@@ -17,30 +17,48 @@ and therefore into every C/C++ object in the SDK and devkit builds.
 import sys
 
 
-TARGET_OLD = """        "-mabi=aapcs-soft",
+TARGET_OLD_WITH_NOPIC = """        "-mabi=aapcs-soft",
         "-mgeneral-regs-only",
         "-ffixed-x18",
         "-fno-pic",
 """
 
-TARGET_NEW = """        "-mabi=aapcs-soft",
+TARGET_NEW_WITH_NOPIC = """        "-mabi=aapcs-soft",
         "-mgeneral-regs-only",
         "-ffixed-x18",
         "-fno-pic",
         "-mbranch-protection=bti",
 """
 
+TARGET_OLD_NO_NOPIC = """        "-mabi=aapcs-soft",
+        "-mgeneral-regs-only",
+        "-ffixed-x18",
+    ],"""
+
+TARGET_NEW_NO_NOPIC = """        "-mabi=aapcs-soft",
+        "-mgeneral-regs-only",
+        "-ffixed-x18",
+        "-mbranch-protection=bti",
+    ],"""
+
 
 def patch(path):
     with open(path, encoding="utf-8") as f:
         text = f.read()
 
-    if TARGET_OLD not in text:
+    if "-mbranch-protection=bti" in text:
+        print(f"already patched: {path}")
+        return True
+
+    if TARGET_OLD_WITH_NOPIC in text:
+        patched = text.replace(TARGET_OLD_WITH_NOPIC, TARGET_NEW_WITH_NOPIC, 1)
+    elif TARGET_OLD_NO_NOPIC in text:
+        patched = text.replace(TARGET_OLD_NO_NOPIC, TARGET_NEW_NO_NOPIC, 1)
+    else:
         print(f"ERROR: expected soft-float arm64 block not found in {path}",
               file=sys.stderr)
         return False
 
-    patched = text.replace(TARGET_OLD, TARGET_NEW, 1)
     with open(path, "w", encoding="utf-8") as f:
         f.write(patched)
     print(f"patched {path}: added -mbranch-protection=bti to arm64 soft-float flags")

@@ -35,6 +35,8 @@ subs = [
      "static struct mm_struct * __nocfi\nfrida_grab_process_mm (int pid)"),
     ("static struct task_struct *\nfrida_grab_process_leader (int pid)",
      "static struct task_struct * __nocfi\nfrida_grab_process_leader (int pid)"),
+    ("static int\nfrida_spawn_trampoline (void * data)",
+     "static int __nocfi\nfrida_spawn_trampoline (void * data)"),
     ("static void\nfrida_reparent_into_group (struct task_struct * leader)",
      "static void __nocfi\nfrida_reparent_into_group (struct task_struct * leader)"),
     ("static void\nfrida_adopt_target_context (struct task_struct * leader)",

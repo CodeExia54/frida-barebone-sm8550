@@ -24,7 +24,7 @@ on:
       frida_version:
         description: 'frida-core/frida-gum tag to build'
         type: string
-        default: '17.17.0'
+        default: '17.19.0'
 
 jobs:
   build-sdk:
@@ -53,7 +53,13 @@ jobs:
           cd frida-core
           git submodule update --init --recursive --depth 1
 
-      - name: Build soft-float SDK (no BTI)
+      - name: Patch releng env_generic.py (arm64 BTI)
+        run: |
+          set -e
+          python3 patch-bti-env.py frida-core/releng/env_generic.py
+          grep -n "mbranch-protection" frida-core/releng/env_generic.py
+
+      - name: Build soft-float SDK with BTI
         run: |
           set -eo pipefail
           export PATH="/usr/lib/llvm-19/bin:$PATH"
@@ -95,6 +101,12 @@ jobs:
           git clone --depth 1 --branch ${{ inputs.frida_version }} --recurse-submodules \
             https://github.com/frida/frida-gum.git
 
+      - name: Patch releng env_generic.py (arm64 BTI)
+        run: |
+          set -e
+          python3 patch-bti-env.py frida-gum/releng/env_generic.py
+          grep -n "mbranch-protection" frida-gum/releng/env_generic.py
+
       - name: Patch gum.c (call glib_init/gobject_init unconditionally)
         run: |
           set -e
@@ -109,6 +121,11 @@ jobs:
           # ("message != NULL &&") or the upstream 17.18.0+ form
           # ("if (message == NULL) return FALSE;").
           grep -nE "message != NULL|message == NULL" frida-gum/bindings/gumjs/gumquickcore.c
+
+      - name: Patch gumarm64writer.c (BTI bypass via ret)
+        run: |
+          set -e
+          python3 patch-gum-bti-ret.py frida-gum/gum/arch-arm64/gumarm64writer.c
 
       - name: Download SDK artifact
         uses: actions/download-artifact@v4
@@ -255,13 +272,13 @@ jobs:
           # includes the header also reaches for.
           export BINDGEN_EXTRA_CLANG_ARGS="-isystem $(clang-19 -print-resource-dir)/include -isystem $SDK/include -I$SDK/include/glib-2.0 -I$SDK/lib/glib-2.0/include -I$SDK/include/capstone -I$SDK/include/json-glib-1.0 --sysroot=$SDK --target=aarch64-none-elf"
           export CC_AGENT="clang-19 --target=aarch64-none-elf -mabi=aapcs-soft \
-            -mgeneral-regs-only -ffixed-x18 -fno-pic --sysroot=$SDK \
+            -mgeneral-regs-only -ffixed-x18 -fno-pic -mbranch-protection=bti --sysroot=$SDK \
             -isystem $SDK/include -I $SDK/include/glib-2.0 -I $SDK/lib/glib-2.0/include \
             -I $SDK/include/capstone -I $SDK/include/json-glib-1.0"
 
           cd frida-core/src/barebone/agent/linux
           make ARCH=arm64 FRIDA_SDK="$SDK" GUMJS_DEVKIT_DIR="/tmp/gumjs-devkit" \
-            AGENT_RUSTFLAGS="-Zfixed-x18" \
+            AGENT_RUSTFLAGS="-Zfixed-x18 -Zbranch-protection=bti" \
             AGENT_LD=aarch64-linux-gnu-ld AGENT_AR=aarch64-linux-gnu-ar \
             AGENT_NM=aarch64-linux-gnu-nm AGENT_OBJCOPY=aarch64-linux-gnu-objcopy \
             CC_aarch64_unknown_none="$CC_AGENT" KDIR="$KDIR" LLVM=1

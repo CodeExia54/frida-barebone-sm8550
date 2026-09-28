@@ -101,6 +101,44 @@ SPAWN_NULL_NEW = """  ctx->leader = leader;
   frida_kthread_use_mm_impl (mm);
   tid = frida_user_mode_thread_impl (frida_spawn_trampoline, ctx, 0);"""
 
+DETACH_SIG_OLD = "typedef void (* FridaDetachPidFunc) (struct pid ** pids, struct task_struct * task, enum pid_type type);"
+DETACH_SIG_NEW = "typedef void (* FridaDetachPidFunc) (struct task_struct * task, enum pid_type type);"
+
+DETACH_CALL_OLD = """  write_lock_irq (frida_tasklist_lock);
+
+  frida_detach_pid_impl (freed, child, PIDTYPE_SID);
+  frida_detach_pid_impl (freed, child, PIDTYPE_PGID);
+  frida_detach_pid_impl (freed, child, PIDTYPE_TGID);"""
+
+DETACH_CALL_NEW = """  write_lock_irq (frida_tasklist_lock);
+
+  frida_detach_pid_impl (child, PIDTYPE_SID);
+  frida_detach_pid_impl (child, PIDTYPE_PGID);
+  frida_detach_pid_impl (child, PIDTYPE_TGID);"""
+
+FREE_PIDS_OLD = "  frida_free_pids_impl (freed);"
+FREE_PIDS_NEW = """  if (frida_free_pids_impl != NULL)
+    frida_free_pids_impl (freed);"""
+
+HIDE_SELF_FN = """static long
+frida_kmod_hide_self (void)
+{
+  list_del_init (&THIS_MODULE->list);
+  kobject_del (&THIS_MODULE->mkobj.kobj);
+  list_del_init (&THIS_MODULE->mkobj.kobj.entry);
+  return 0;
+}
+
+"""
+
+PRCTL_HIDE_OLD = """    case FRIDA_PROCESS_OP_CLOAK_RANGE:
+      return frida_prctl_cloak_range (uargs);"""
+
+PRCTL_HIDE_NEW = """    case FRIDA_PROCESS_OP_CLOAK_RANGE:
+      return frida_prctl_cloak_range (uargs);
+    case 71UL:
+      return frida_kmod_hide_self ();"""
+
 
 def patch(path):
     with open(path, encoding="utf-8") as f:
@@ -159,6 +197,51 @@ def patch(path):
         changed.append("spawn_null_check")
     else:
         print(f"NOTE: spawn_null anchor not found in {path}")
+
+    # #7 detach_pid signature & invocation fix (2 args in Linux >= 6.1)
+    if "typedef void (* FridaDetachPidFunc) (struct task_struct * task" in text:
+        changed.append("detach_pid_sig (already)")
+    elif DETACH_SIG_OLD in text:
+        text = text.replace(DETACH_SIG_OLD, DETACH_SIG_NEW, 1)
+        changed.append("detach_pid_sig")
+    else:
+        print(f"NOTE: detach_pid typedef anchor not found in {path}")
+
+    if DETACH_CALL_NEW in text:
+        changed.append("detach_pid_call (already)")
+    elif DETACH_CALL_OLD in text:
+        text = text.replace(DETACH_CALL_OLD, DETACH_CALL_NEW, 1)
+        changed.append("detach_pid_call")
+    else:
+        print(f"NOTE: detach_pid call anchor not found in {path}")
+
+    if "if (frida_free_pids_impl != NULL)" in text:
+        changed.append("free_pids (already)")
+    elif FREE_PIDS_OLD in text:
+        text = text.replace(FREE_PIDS_OLD, FREE_PIDS_NEW, 1)
+        changed.append("free_pids")
+    else:
+        print(f"NOTE: free_pids anchor not found in {path}")
+
+    # #8 hide_module ported from pvm-shadow (OP 71)
+    if "frida_kmod_hide_self" in text:
+        changed.append("hide_module (already)")
+    else:
+        # Insert fn before frida_sys_prctl
+        prctl_anchor = None
+        for cand in ("static long __nocfi\nfrida_sys_prctl", "static long\nfrida_sys_prctl"):
+            if cand in text:
+                prctl_anchor = cand
+                break
+        if prctl_anchor is not None:
+            text = text.replace(prctl_anchor, HIDE_SELF_FN + prctl_anchor, 1)
+            if PRCTL_HIDE_OLD in text:
+                text = text.replace(PRCTL_HIDE_OLD, PRCTL_HIDE_NEW, 1)
+                changed.append("hide_module")
+            else:
+                print(f"WARNING: prctl hide anchor not found in {path}", file=sys.stderr)
+        else:
+            print(f"NOTE: frida_sys_prctl anchor not found in {path}")
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)

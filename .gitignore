@@ -8,3 +8,5 @@ panic_kmsg.txt
 deploy/
 *.ko
 *.o.bin
+__pycache__/
+*.pyc
