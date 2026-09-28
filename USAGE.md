@@ -8,19 +8,19 @@ phone's exact KMI target and `adb` access to the phone with root (`su`).
 | File | Role |
 |---|---|
 | `frida-agent_<kmi>.ko` (matching your phone's kernel — see Step 1) | Runs **inside the kernel**. Exposes `/dev/frida`, a char device. This is the actual instrumentation engine — GumJS running in kernel context. |
-| `frida-server-17.17.0-android-arm64-barebone` | Runs as a normal Android process (as root). Opens `/dev/frida` and re-exposes it as an ordinary Frida TCP endpoint. **Built by this repo's CI (`build-frida-server-barebone.yml`) with the Barebone backend compiled in.** |
-| `linux-kmod.json` | Tells the server *how* to reach the module: the Barebone `device` transport at `/dev/frida`, not the usual ptrace path. |
-| `frida` / `frida-ps` (the client, `pip install frida-tools`) | What you type commands into, on any machine. Talks to the server over TCP. Not shipped here — it's a stock pip install. |
+| `frida-server-17.19.0-android-arm64-barebone` | Runs as a normal Android process (as root). Opens `/dev/frida` and re-exposes it as an ordinary Frida TCP endpoint for a **PC-side** client. **Built by this repo's CI (`build-frida-server-barebone.yml`) with the Barebone backend compiled in.** |
+| `frida-inject-17.19.0-android-arm64-barebone` | Same Barebone backend, but a standalone on-device tool instead of a TCP server — runs a compiled agent script directly against `/dev/frida` with **no PC, no network, nothing to forward**. See "No PC at all" below. **Built by this repo's CI (`build-frida-inject-barebone.yml`).** |
+| `linux-kmod.json` | Tells `frida-server`/`frida-inject` *how* to reach the module: the Barebone `device` transport at `/dev/frida`, not the usual ptrace path. |
+| `frida` / `frida-ps` (the client, `pip install frida-tools`) | What you type commands into, on any machine, when using `frida-server`. Talks to the server over TCP. Not shipped here — it's a stock pip install. Not needed at all for the `frida-inject` standalone path. |
 
-> **Why a special `frida-server`?** The Barebone backend is what talks to
-> `/dev/frida`. Frida's **official** prebuilt `frida-server` for Android is
-> built **without** it (at 17.17.0 the Barebone backend is only auto-compiled
-> into desktop Frida, never the Android server). A stock `frida-server` has
-> only the `local`/`socket`/`remote` backends, so `--device barebone` fails
-> with **"Device not found"** even though the module is loaded and `/dev/frida`
-> exists. The `-barebone` server in this release is the same 17.17.0 source
-> rebuilt with `-Dfrida-core:barebone_backend=enabled` — that one binary is the
-> whole difference.
+> **Why a special `frida-server` / `frida-inject`?** The Barebone backend is
+> what talks to `/dev/frida`. Frida's **official** prebuilt Android binaries
+> are built **without** it (the Barebone backend is only auto-compiled into
+> desktop Frida, never Android, upstream). A stock binary has only the
+> `local`/`socket`/`remote` backends, so `--device barebone` fails with
+> **"Device not found"** even though the module is loaded and `/dev/frida`
+> exists. Both binaries in this release are the same 17.19.0 source rebuilt
+> with `-Dfrida-core:barebone_backend=enabled` — that's the whole difference.
 
 ## Step 1 — pick the right `.ko`
 
@@ -41,11 +41,14 @@ vermagic — see Step 3.
 
 ```sh
 adb push frida-agent_<kmi>.ko /data/local/tmp/frida-agent.ko
-adb push frida-server-17.17.0-android-arm64-barebone /data/local/tmp/frida-server
+adb push frida-server-17.19.0-android-arm64-barebone /data/local/tmp/frida-server
+adb push frida-inject-17.19.0-android-arm64-barebone /data/local/tmp/frida-inject
 adb push linux-kmod.json /data/local/tmp/
 
-adb shell su -c 'chmod 755 /data/local/tmp/frida-server'
+adb shell su -c 'chmod 755 /data/local/tmp/frida-server /data/local/tmp/frida-inject'
 ```
+
+(Push whichever of `frida-server`/`frida-inject` matches the path you're taking — Step 4 below covers both.)
 
 Everything lives in `/data/local/tmp/` — no install, no APK, nothing persists
 across reboot.
@@ -81,7 +84,9 @@ If you see `insmod: ... invalid module format` or a vermagic error, the
   real crash — capture the log first (`dmesg -w | tee log.txt &` right before
   `insmod`).
 
-## Step 4 — start the transport (`frida-server`, Barebone backend)
+## Step 4 — pick a path: PC-connected server, or standalone on-device inject
+
+### 4a — `frida-server` (needs a PC-side client)
 
 ```sh
 adb shell su -c 'FRIDA_BAREBONE_CONFIG=/data/local/tmp/linux-kmod.json \
@@ -95,10 +100,7 @@ listening on `127.0.0.1:27042` **on the phone**, bridging to `/dev/frida`.
 > `/dev/frida`. Running the server as `su`/root (above) is usually enough; if
 > `open(/dev/frida)` is denied, that's an SELinux label issue, not the module.
 
-## Step 5 — reach it from a client
-
-The client is the stock `frida` CLI (`pip install frida-tools`) on any
-machine. Forward the port and connect:
+Then, from any machine with `pip install frida-tools`:
 
 ```sh
 adb forward tcp:27042 tcp:27042
@@ -110,11 +112,33 @@ That is what this module is for: a GumJS session running in kernel context.
 Your JS runs inside the kernel module via the exact same GumJS engine every
 other Frida target uses.
 
-> **No PC at all?** The split is unavoidable: the phone runs the *server*, and
-> *something* has to be the *client*. That client is normally the `frida` CLI
-> on a PC (nothing we ship — just `pip install frida-tools`). Running the
-> client on the phone itself means Termux + Python, which is possible but
-> fiddly and out of scope here.
+### 4b — `frida-inject` (no PC, no network, entirely on-device)
+
+`frida-inject` talks to `/dev/frida` directly through the same Barebone
+backend — there's no TCP server and nothing to `adb forward`. This is the
+actual "no PC at all" path: everything after `insmod` happens in one `adb
+shell` (or, once you're comfortable, from a Termux shell on the phone with no
+PC involved at all).
+
+```sh
+adb shell su -c 'FRIDA_BAREBONE_CONFIG=/data/local/tmp/linux-kmod.json \
+  /data/local/tmp/frida-inject -D barebone -p 0 -s /data/local/tmp/agent.js'
+```
+
+- `-D barebone` selects the Barebone device (same one `--device barebone`
+  selects for `frida-server`), instead of the default local device.
+- `-p 0` targets the bare-metal target, same meaning as in 4a.
+- `-s agent.js` is your compiled GumJS agent script, pushed alongside the
+  other files.
+
+> **Not device-verified in this session** — this binary was built and
+> confirmed to compile/link cleanly against the Barebone backend
+> (`build-frida-inject-barebone.yml`), but the `-D barebone -p 0` invocation
+> above follows Frida's standard device-selection CLI convention rather than
+> having been exercised against a real `/dev/frida` node. If `-D barebone`
+> isn't recognized, run `frida-inject --help` on-device and cross-check
+> against `frida-server`'s accepted device names — the Barebone backend
+> exposes the same device identity to both tools either way.
 
 ## Cleanup
 
