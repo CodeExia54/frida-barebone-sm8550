@@ -72,6 +72,7 @@ docker exec -e "FRIDA_VERSION=$FRIDA_VERSION" -e "KMI=$KMI" \
 
   python3 /host/patch-cfi.py src/barebone/agent/linux/frida-kmod.c
   python3 /host/patch-cache-flush-kallsyms.py src/barebone/agent/linux/frida-kmod.c
+  python3 /host/patch-kfifo-vmalloc.py src/barebone/agent/linux/frida-kmod.c
   cat >> src/barebone/agent/linux/Kbuild <<0EOF0
 
 ccflags-y += -Wno-implicit-function-declaration

@@ -23,6 +23,11 @@ jobs:
           git clone --depth 1 --branch "$FRIDA_VERSION" https://github.com/frida/frida.git .
           git config --global --add safe.directory "$PWD"
 
+      - name: Check out this fork (for our corrected linux-kmod*.json)
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
       - name: Fetch submodules (releng + frida-core + frida-gum)
         run: |
           python tools/ensure-submodules.py frida-core frida-gum
@@ -60,7 +65,11 @@ jobs:
 
       - name: Collect linux-kmod.json (barebone device transport config)
         run: |
-          find subprojects/frida-core -path '*barebone/agent/etc/linux-kmod*.json' -exec cp {} "$FRIDA_PREFIX/bin/" \;
+          # See the matching step in build-frida-inject-barebone.yml: upstream's
+          # own etc/linux-kmod*.json are missing "agent.type", which makes
+          # BareboneConfig reject them ("Config for 'agent' is invalid"). Ship
+          # this fork's corrected copies instead.
+          cp fork/linux-kmod.json fork/linux-kmod-socket.json "$FRIDA_PREFIX/bin/"
           ls -la "$FRIDA_PREFIX/bin/"
 
       - name: Upload frida-server + config

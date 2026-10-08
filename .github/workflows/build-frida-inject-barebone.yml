@@ -23,6 +23,11 @@ jobs:
           git clone --depth 1 --branch "$FRIDA_VERSION" https://github.com/frida/frida.git .
           git config --global --add safe.directory "$PWD"
 
+      - name: Check out this fork (for our corrected linux-kmod*.json)
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
       - name: Fetch submodules (releng + frida-core + frida-gum)
         run: |
           python tools/ensure-submodules.py frida-core frida-gum
@@ -60,7 +65,16 @@ jobs:
 
       - name: Collect linux-kmod.json (barebone device transport config)
         run: |
-          find subprojects/frida-core -path '*barebone/agent/etc/linux-kmod*.json' -exec cp {} "$FRIDA_PREFIX/bin/" \;
+          # Upstream frida-core's own etc/linux-kmod*.json ship the "agent"
+          # object without a "type" field. BareboneConfig's deserializer
+          # (src/frida.vala) treats a missing agent.type as "invalid", so
+          # loading that file as-is fails every time with:
+          #   Unable to load .../linux-kmod.json: Config for 'agent' is invalid
+          # Our copies in this fork (linux-kmod.json / linux-kmod-socket.json)
+          # add the required "type": "resident" - verified end-to-end against
+          # a loaded frida-agent.ko on a real device. Ship those instead of
+          # upstream's broken originals.
+          cp fork/linux-kmod.json fork/linux-kmod-socket.json "$FRIDA_PREFIX/bin/"
           ls -la "$FRIDA_PREFIX/bin/"
 
       - name: Upload frida-inject + config
