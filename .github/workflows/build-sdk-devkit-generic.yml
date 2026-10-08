@@ -127,6 +127,12 @@ jobs:
           set -e
           python3 patch-gum-bti-ret.py frida-gum/gum/arch-arm64/gumarm64writer.c
 
+      - name: Patch gumquickcore.c (BTI-safe stub for NativeFunction calls)
+        run: |
+          set -e
+          python3 patch-gum-bti-nativefunction.py frida-gum/bindings/gumjs/gumquickcore.c
+          grep -n "gum_arm64_get_bti_safe_call_target" frida-gum/bindings/gumjs/gumquickcore.c | head
+
       - name: Download SDK artifact
         uses: actions/download-artifact@v4
         with:
