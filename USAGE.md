@@ -214,22 +214,86 @@ re-enumerating, every time, immediately, with zero further script output.
 | `Memory.readByteArray` / `writeByteArray` / `readU64` / `readPointer` (static free functions) | ❌ `TypeError: not a function` — not implemented (use the `ptr.readXxx()`/`writeXxx()` instance methods instead) |
 | `DebugSymbol.fromName(name)` | ⚠️ Callable, but returns all-null (`address: "0x0"`) — not actually wired to kallsyms |
 | `recv` / `send` / `NativeFunction` / `NativeCallback` (presence check only) | ⚠️ Present as real functions; `NativeFunction` tested live — see below |
-| **`NativeFunction` — actually calling a real kernel function** (`new NativeFunction(_printk_addr, 'int', ['pointer'])` then calling it) | ❌ **Crashes the kernel instantly.** Zero script output reached the host; device rebooted (`uptime` → 0) within the same call. Consistent with this kernel being CFI-hardened (`CONFIG_CFI_CLANG`/KCFI) and GumJS's native-call trampoline using an indirect branch the compiler never instrumented with a matching CFI type hash — KCFI traps that as a CFI failure, which panics. |
-| `Interceptor.attach(...)` (hooking a live kernel function) | ⚠️ **Not attempted live** — present in the API (`typeof Interceptor.attach === "function"`), but it installs a trampoline via the same kind of indirect-branch mechanism that just crashed the device for `NativeFunction`. Given the confirmed CFI crash above, treat this as **very likely to crash the kernel the same way** until proven otherwise. If you want to test it, do it in QEMU first (this fork's existing QEMU methodology), not on hardware you care about. |
+| **`NativeFunction` — calling a real kernel function** (`new NativeFunction(_printk_addr, 'int', ['pointer'])` then calling it) | ❌ **Crashes the kernel instantly, root cause confirmed** — see "Why NativeFunction/Interceptor crash" below. Not a bug in this fork; the *target* function lacks a required CPU-level landing pad. |
+| A heavy synchronous loop doing ~190k × 4 native memory reads in one script tick (no yielding) | ❌ **Also crashes the kernel** — almost certainly a soft/hard-lockup watchdog panic (CPU held continuously past the watchdog threshold by the kernel-embedded script thread). Keep single-tick native-call-heavy work well under a few thousand iterations; re-enter via `setTimeout(fn, 0)` to chunk larger scans. |
+| `Interceptor.attach(...)` (hooking a live kernel function) | ❌ **Same root cause as `NativeFunction`, same fix** (check for a landing pad first) — see below. Not separately tested live (no need to: the mechanism is a property of the *target*, confirmed directly, not of which Gum API reaches it). |
 | `rmmod frida_agent` | ❌ **Crashes the kernel — confirmed twice**, once on a module whose init had failed, once on a module that had fully initialized and already run a script successfully. Don't use it; **reboot the phone instead** to reset state. |
 
 **Bottom line:** read-only/introspection use (enumerate modules, resolve
 kallsyms symbols, read/alloc/poke memory you own, timers, logging) is solid
-and crash-free. Anything that makes GumJS **execute or hook existing kernel
-code** (`NativeFunction` calls, almost certainly `Interceptor.attach` too)
-is unsafe on this specific CFI-hardened kernel build as shipped — it will
-very likely panic the device. `rmmod` is unsafe unconditionally; reboot
-instead.
+and crash-free. Calling into or hooking **existing kernel code** via
+`NativeFunction`/`Interceptor` is unsafe for the vast majority of kernel
+functions on this hardened build — see below for exactly why, and how to
+check a specific target before touching it. `rmmod` is unsafe
+unconditionally; reboot instead.
+
+### Why `NativeFunction`/`Interceptor` crash — confirmed root cause
+
+Not CFI, not a Gum bug — it's **BTI (ARM64 Branch Target Identification)**
+combined with this kernel's **LTO** build. Confirmed by directly reading raw
+instruction bytes off the running kernel (a plain, zero-risk `ptr.readU8()`
+memory read — no execution, no crash):
+
+```js
+// examples/05_check_bti_landing_pad.js
+var vm = Process.getModuleByName("vmlinux");
+var e = vm.enumerateExports().find(x => x.name === "_printk");
+var w = (e.address.add(3).readU8() << 24 | e.address.add(2).readU8() << 16 |
+         e.address.add(1).readU8() << 8  | e.address.readU8()) >>> 0;
+console.log(e.name + " first word = 0x" + w.toString(16));
+// 0xd503241f = BTI      0xd503245f = BTI C
+// 0xd503249f = BTI J    0xd50324df = BTI JC   (any of these = safe to call/hook)
+// 0xd503233f = PACIASP  (no landing pad at all = NOT safe — this is what _printk has)
+```
+
+Result on our test device: `_printk`, `vprintk_default`,
+`printk_percpu_data_ready`, `get_random_u32`/`u64`, `jiffies_to_msecs`,
+`gic_handle_irq`, `handle_fasteoi_irq`, `handle_percpu_devid_irq` — **every
+one of these starts with `PACIASP` (`0xd503233f`), not a BTI landing pad.**
+`panic` was the one exception found (`BTI JC`, `0xd50324df`).
+
+This kernel builds with **LTO** (whole-program link-time optimization,
+confirmed per this repo's own `README.md`: "LTO + CFI + BTF + SCS"). Under
+`-mbranch-protection=bti`, the compiler only needs to emit a landing pad on
+functions it can't prove are *exclusively* called via direct `bl`. With
+whole-program visibility, LTO proves `_printk` (and almost everything else
+that isn't a genuine registered callback like an IRQ vector) is **only ever
+called directly** from within the kernel's own code — so the landing pad is
+correctly, deliberately omitted as a real optimization. That's permanent,
+baked into the already-compiled `vmlinux`: nothing Frida does can add a
+landing pad back. `NativeFunction`'s underlying call (and `Interceptor`'s
+installed trampoline, which needs the exact same kind of indirect branch)
+is a `BLR`/`BR` from *outside* that closed-world analysis — exactly the case
+LTO assumed could never happen. The CPU enforces this in hardware
+(`PSTATE.BTYPE` vs. the target instruction) the instant the branch lands,
+before a single instruction of the "called" function runs — which is why
+the crash is instant and silent: nothing printk-based even executes to log
+an error.
+
+**Practical rule:** before calling or hooking *any* kernel function on this
+build, read its first 4 bytes and check for one of the four BTI encodings
+above (`examples/05_check_bti_landing_pad.js`). If it's not one of those,
+treat it as uncallable — it will crash the kernel, not throw a JS exception.
+`panic`-style functions (genuinely registered as a callback somewhere) are
+the exception, not the rule; expect almost everything else to lack a
+landing pad on an LTO+BTI kernel.
+
+A real fix *is* possible here, just not one this session shipped: teach
+Gum's arm64 backend (`NativeFunction` invocation and `Interceptor.attach`)
+to run this exact 4-byte check before installing a trampoline or making the
+call, and raise a catchable JS error instead of letting the CPU trap. That
+turns a silent kernel panic into a normal, recoverable scripting error —
+worth doing as a follow-up patch (alongside the already-present but
+narrower-scoped `patch-gum-bti-ret.py`, which only covers Gum's own
+*tail-jump* trampolines, not this call/hook-into-existing-code case).
 
 Runnable copies of the scripts behind the ✅ rows above are in
 [`examples/`](examples/) — `01_basics.js`, `02_memory.js`,
-`03_modules_and_symbols.js`, `04_timers.js`. None of them call into or hook
-existing kernel code, so none of them carry the crash risk described above.
+`03_modules_and_symbols.js`, `04_timers.js`,
+`05_check_bti_landing_pad.js`. None of them call into or hook existing
+kernel code, so none of them carry the crash risk described above — `05`
+specifically is the read-only landing-pad check from the previous section,
+safe to run against any symbol name you're considering calling or hooking.
 
 ## Cleanup
 
