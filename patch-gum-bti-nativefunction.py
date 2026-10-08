@@ -37,6 +37,19 @@ stub never needs its own epilogue.
 Skipped entirely when the target already has a landing pad (the normal
 case for anything actually registered as a callback somewhere, e.g.
 panic()) - no stub built, no overhead, ffi_call calls it exactly as before.
+
+The stub memory comes from GumCodeAllocator's slice API
+(gum_code_allocator_alloc_slice + gum_code_allocator_commit) - the same
+mechanism this backend's own Interceptor trampolines already use
+successfully (see gum_write_thunk in gumcodeallocator.c, and
+backend-arm64/guminterceptor-arm64.c's trampoline_slice usage) - not the
+generic gum_memory_allocate()+gum_memory_mark_code() pair, which a first
+version of this patch used and which is unproven (and, confirmed on real
+hardware, broken) on this exotic bare-metal kernel backend: it crashed the
+device with zero output, independent of the BTI diagnosis above.
+GumCodeSlice separates the writable address (->data) from the address the
+code will actually execute at (->pc) - exactly the split this backend may
+need and the generic pair doesn't know about.
 """
 import sys
 
@@ -50,6 +63,7 @@ INCLUDE_NEW = """#include "gumsourcemap.h"
 
 #ifdef HAVE_ARM64
 #include <gum/arch-arm64/gumarm64writer.h>
+#include <gum/gumcodeallocator.h>
 
 /*
  * On a Linux kernel built with CONFIG_ARM64_BTI_KERNEL + LTO, almost every
@@ -64,9 +78,15 @@ INCLUDE_NEW = """#include "gumsourcemap.h"
  * branch (in range: BTI-exempt by architecture) or LDR+RET (out of range:
  * RET is BTI-exempt regardless of distance). Intentionally never freed -
  * this backend's whole lifetime is one kernel boot, and a handful of
- * one-page stubs is noise next to everything else already resident.
+ * one-slice stubs is noise next to everything else already resident.
+ *
+ * Stub memory comes from GumCodeAllocator - the same mechanism this
+ * backend's own Interceptor trampolines already use successfully - not
+ * the generic gum_memory_allocate()/gum_memory_mark_code() pair, which is
+ * unproven on this exotic bare-metal backend.
  */
 
+static GumCodeAllocator gum_bti_stub_allocator;
 static GHashTable * gum_bti_stub_cache = NULL;
 G_LOCK_DEFINE_STATIC (gum_bti_stub_cache);
 
@@ -90,7 +110,7 @@ static gpointer
 gum_arm64_get_bti_safe_call_target (gpointer target)
 {
   gpointer stub;
-  guint page_size;
+  GumCodeSlice * slice;
   GumArm64Writer aw;
 
   if (gum_arm64_address_has_bti_landing_pad (target))
@@ -99,7 +119,10 @@ gum_arm64_get_bti_safe_call_target (gpointer target)
   G_LOCK (gum_bti_stub_cache);
 
   if (gum_bti_stub_cache == NULL)
+  {
     gum_bti_stub_cache = g_hash_table_new (NULL, NULL);
+    gum_code_allocator_init (&gum_bti_stub_allocator, 256);
+  }
 
   stub = g_hash_table_lookup (gum_bti_stub_cache, target);
   if (stub != NULL)
@@ -108,11 +131,10 @@ gum_arm64_get_bti_safe_call_target (gpointer target)
     return stub;
   }
 
-  page_size = gum_query_page_size ();
-  stub = gum_memory_allocate (NULL, page_size, page_size, GUM_PAGE_RW);
+  slice = gum_code_allocator_alloc_slice (&gum_bti_stub_allocator);
 
-  gum_arm64_writer_init (&aw, stub);
-  aw.pc = GUM_ADDRESS (stub);
+  gum_arm64_writer_init (&aw, slice->data);
+  aw.pc = GUM_ADDRESS (slice->pc);
 
   gum_arm64_writer_put_instruction (&aw, 0xd503245f); /* bti c */
 
@@ -126,7 +148,9 @@ gum_arm64_get_bti_safe_call_target (gpointer target)
   gum_arm64_writer_flush (&aw);
   gum_arm64_writer_clear (&aw);
 
-  gum_memory_mark_code (stub, page_size);
+  gum_code_allocator_commit (&gum_bti_stub_allocator);
+
+  stub = slice->pc;
 
   g_hash_table_insert (gum_bti_stub_cache, target, stub);
 
